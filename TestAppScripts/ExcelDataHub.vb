@@ -3,15 +3,10 @@ Imports Microsoft.Office.Interop.Excel
 
 Public Class ExcelDataHub
 
-    'Private ReadOnly _filePath As String
-    'Private ReadOnly _worksheetName As String
-
     Private _filePath As String
     Private _worksheetName As String
 
-
     Private _excelApp As Application
-    'Private _workbook As Workbook
     Public _workbook As Workbook
     Public _worksheet As Worksheet
 
@@ -36,6 +31,7 @@ Public Class ExcelDataHub
             Return _worksheetName
         End Get
     End Property
+
     Public Sub New(filePath As String,
                    worksheetName As String)
 
@@ -45,13 +41,18 @@ Public Class ExcelDataHub
     End Sub
 
 
+    ''' <summary>
+    ''' Writes the parameters to the worksheet.
+    ''' All-or-nothing: nothing is saved to disk unless every parameter was written.
+    ''' Throws DataHubException on any failure.
+    ''' </summary>
     Public Sub WriteParameters(parameterList As List(Of ParameterInfo))
 
-        OpenWorkbook()
-
-        Dim nextRow As Integer = GetNextAvailableRow()
-
         Try
+
+            OpenWorkbook()
+
+            Dim nextRow As Integer = GetNextAvailableRow()
 
             For Each parameter As ParameterInfo In parameterList
 
@@ -66,13 +67,21 @@ Public Class ExcelDataHub
 
             Next
 
+            ' Explicit save, only reached if every write succeeded
             _workbook.Save()
+
+        Catch ex As COMException
+
+            Throw New DataHubException(
+                "Excel reported an error while writing the parameters: " & ex.Message, ex)
 
         Finally
 
+            ' Always runs: never leaves a hidden Excel process or a locked file behind
             CloseWorkbook()
 
         End Try
+
     End Sub
 
 
@@ -95,41 +104,131 @@ Public Class ExcelDataHub
     End Sub
 
 
+    '-----------------------------------------
+    ' Open / close
+    '-----------------------------------------
+
     Private Sub OpenWorkbook()
-        'Public Sub OpenWorkbook()
 
-        _excelApp = New Application
+        If Not System.IO.File.Exists(_filePath) Then
+            Throw New DataHubException("The Data Hub file does not exist: " & _filePath)
+        End If
 
-        _excelApp.Visible = False
+        ' Checked BEFORE starting Excel, so no hidden dialog can ever block the application
+        EnsureFileIsNotLocked()
 
-        _workbook = _excelApp.Workbooks.Open(_filePath)
+        Try
 
-        _worksheet = CType(_workbook.Worksheets(_worksheetName), Worksheet)
+            _excelApp = New Application
+            _excelApp.Visible = False
+            _excelApp.DisplayAlerts = False
+
+            _workbook = _excelApp.Workbooks.Open(_filePath, UpdateLinks:=0)
+
+            If _workbook.ReadOnly Then
+                Throw New DataHubException(
+                    "The Data Hub file was opened as read-only. Check the file attributes and permissions.")
+            End If
+
+            Try
+                _worksheet = CType(_workbook.Worksheets(_worksheetName), Worksheet)
+            Catch ex As Exception When TypeOf ex Is COMException OrElse TypeOf ex Is InvalidCastException
+                Throw New DataHubException(
+                    "The worksheet '" & _worksheetName & "' was not found in the Data Hub.", ex)
+            End Try
+
+        Catch ex As COMException
+
+            Throw New DataHubException("Could not open the Data Hub with Excel: " & ex.Message, ex)
+
+        End Try
 
     End Sub
 
 
+    ''' <summary>
+    ''' Excel keeps an open workbook locked, so a failed exclusive open means the file
+    ''' is in use by another program (usually Excel itself).
+    ''' </summary>
+    Private Sub EnsureFileIsNotLocked()
+
+        Try
+
+            Using stream As New System.IO.FileStream(
+                _filePath,
+                System.IO.FileMode.Open,
+                System.IO.FileAccess.ReadWrite,
+                System.IO.FileShare.None)
+            End Using
+
+        Catch ex As System.IO.IOException
+
+            Throw New DataHubException(
+                "The Data Hub file is open in another program (probably Excel)." & vbCrLf &
+                "Close it and try again.", ex)
+
+        Catch ex As UnauthorizedAccessException
+
+            Throw New DataHubException(
+                "The Data Hub file cannot be modified (read-only file or missing permissions).", ex)
+
+        End Try
+
+    End Sub
+
+
+    ''' <summary>
+    ''' Safe to call at any point, even if the open was only partially completed.
+    ''' Never saves (the explicit Save in WriteParameters is the only thing that persists changes)
+    ''' and never throws, so it cannot hide the original error.
+    ''' </summary>
     Private Sub CloseWorkbook()
-        'Public Sub CloseWorkbook()
 
-        If _workbook IsNot Nothing Then
-            _workbook.Close(True)
-        End If
+        Try
+            If _workbook IsNot Nothing Then _workbook.Close(False)
+        Catch ex As Exception
+            ' Cleanup must not mask the original error
+        End Try
 
-        If _excelApp IsNot Nothing Then
-            _excelApp.Quit()
-        End If
+        Try
+            If _excelApp IsNot Nothing Then _excelApp.Quit()
+        Catch ex As Exception
+            ' Cleanup must not mask the original error
+        End Try
 
-        Marshal.ReleaseComObject(_worksheet)
-        Marshal.ReleaseComObject(_workbook)
-        Marshal.ReleaseComObject(_excelApp)
+        ReleaseComObject(_worksheet)
+        ReleaseComObject(_workbook)
+        ReleaseComObject(_excelApp)
 
         _worksheet = Nothing
         _workbook = Nothing
         _excelApp = Nothing
 
+        ' Releases the temporary COM wrappers created by chained calls like Cells(row, col).Value,
+        ' which are the usual reason an EXCEL.EXE process stays alive after Quit
+        GC.Collect()
+        GC.WaitForPendingFinalizers()
+        GC.Collect()
+
     End Sub
 
+
+    Private Sub ReleaseComObject(comObject As Object)
+
+        If comObject Is Nothing Then Return
+
+        Try
+            Marshal.FinalReleaseComObject(comObject)
+        Catch ex As Exception
+            ' Cleanup must not mask the original error
+        End Try
+
+    End Sub
+
+
+    '-----------------------------------------
+    ' Row / cell helpers
+    '-----------------------------------------
 
     Private Function FindParameterRow(parameterName As String) As Integer
 
@@ -171,9 +270,8 @@ Public Class ExcelDataHub
 
         _worksheet.Cells(row, COL_PATH).Value = parameter.Location
 
-
-
     End Sub
+
 
     Private Function GetNextAvailableRow() As Integer
 
@@ -189,15 +287,19 @@ Public Class ExcelDataHub
         Return row
 
     End Function
+
+
     Public Sub SetFilePath(filePath As String)
 
         _filePath = filePath
 
     End Sub
 
+
     Public Sub SetWorksheetName(worksheetName As String)
 
         _worksheetName = worksheetName
 
     End Sub
+
 End Class
